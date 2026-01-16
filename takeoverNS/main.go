@@ -77,20 +77,27 @@ func main() {
 					continue
 				}
 
-				// For any provider NS found, run dig host @NS and count REFUSED
-				// If any provider gets REFUSED>0, alert (and alert only once per provider).
+				// For any provider NS found, run dig host @NS and collect REFUSED NS.
+				// If any provider gets refused>0, alert (and alert only once per provider).
 				for p, nsList := range nsByProv {
 					if len(nsList) == 0 {
 						continue
 					}
-					refusedCount := 0
+
+					var refusedNS []string
 					for _, ns := range nsList {
 						if digStatusRefused(host, ns, tmo) {
-							refusedCount++
+							refusedNS = append(refusedNS, ns)
 						}
 					}
-					if refusedCount > 0 {
-						alerts <- fmt.Sprintf("[%s] DNS Zone takeover - %s", providerLabel(p), host)
+
+					if len(refusedNS) > 0 {
+						alerts <- fmt.Sprintf(
+							"[%s] DNS Zone takeover - %s - NS Records: [%s]",
+							providerLabel(p),
+							host,
+							strings.Join(refusedNS, ", "),
+						)
 					}
 				}
 			}
@@ -289,7 +296,6 @@ func runDig(tmo time.Duration, args ...string) (string, error) {
 
 	b, err := cmd.CombinedOutput()
 	if err != nil {
-		// still return output for debugging if needed, but caller uses error to skip
 		return "", err
 	}
 	return string(b), nil
