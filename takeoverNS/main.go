@@ -251,7 +251,7 @@ func probeAuthoritative(nameFQDN, nsHost string, tmo time.Duration) NSProbe {
 
 	nsHost = strings.TrimSpace(nsHost)
 	nsHost = strings.TrimSuffix(nsHost, ".")
-	nsHostFQDN := dns.Fqdn(nsHost)
+	// (removed unused nsHostFQDN)
 
 	// Resolve NS hostname to an IP using system resolver (not 1.1.1.1/8.8.8.8 requirement).
 	// Your requirement applies to the SERVFAIL check; this step is needed to talk to the NS.
