@@ -2,11 +2,11 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"regexp"
 	"strings"
 	"sync"
@@ -15,50 +15,36 @@ import (
 	"github.com/miekg/dns"
 )
 
-type NSProbe struct {
-	NS       string `json:"ns"`
-	Rcode    string `json:"rcode"`
-	Duration int64  `json:"duration_ms"`
-	Error    string `json:"error,omitempty"`
-}
-
-type Result struct {
-	Subdomain     string    `json:"subdomain"`
-	Resolver      string    `json:"resolver"`
-	Servfail      bool      `json:"servfail"`
-	ServfailRcode string    `json:"servfail_rcode"`
-	NSRecords     []string  `json:"ns_records,omitempty"`
-	Provider      string    `json:"provider,omitempty"`
-	RefusedChecks []NSProbe `json:"refused_checks,omitempty"`
-	Vulnerable    bool      `json:"vulnerable"`
-	Notes         []string  `json:"notes,omitempty"`
-}
-
 var (
-	inFile      = flag.String("i", "", "Input file (one subdomain per line). If empty, reads stdin.")
-	resolverIP  = flag.String("resolver", "1.1.1.1", "Resolver to use for SERVFAIL check and NS lookup: 1.1.1.1 or 8.8.8.8")
+	inFile      = flag.String("i", "", "Input file (one host per line). If empty, reads stdin.")
 	concurrency = flag.Int("c", 25, "Concurrency")
 	timeoutMS   = flag.Int("timeout", 2500, "DNS timeout in ms (per query)")
-	jsonOut     = flag.Bool("json", false, "Output JSON lines")
-	verbose     = flag.Bool("v", false, "Verbose stderr logging")
 )
 
 var (
+	// Your 3 regex signals
 	reAWS   = regexp.MustCompile(`awsdns-`)
 	reGCP   = regexp.MustCompile(`googledomains\.com`)
 	reAzure = regexp.MustCompile(`azure-dns`)
+
+	// Parse NS hostnames from dig +trace output lines like:
+	// example.com.  172800  IN  NS  ns-123.awsdns-45.net.
+	reTraceNSLine = regexp.MustCompile(`\sIN\s+NS\s+([A-Za-z0-9._-]+)\.?$`)
+)
+
+type provider int
+
+const (
+	provUnknown provider = iota
+	provRoute53
+	provGoogleDomains
+	provAzureDNS
 )
 
 func main() {
 	flag.Parse()
 
-	resolver := normalizeResolver(*resolverIP)
-	if resolver == "" {
-		fmt.Fprintln(os.Stderr, "Invalid -resolver. Use 1.1.1.1 or 8.8.8.8")
-		os.Exit(2)
-	}
-
-	subdomains, err := readLines(*inFile)
+	hosts, err := readLines(*inFile)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error reading input:", err)
 		os.Exit(1)
@@ -67,255 +53,66 @@ func main() {
 	tmo := time.Duration(*timeoutMS) * time.Millisecond
 
 	jobs := make(chan string)
-	results := make(chan Result)
+	alerts := make(chan string)
 
 	var wg sync.WaitGroup
 	for i := 0; i < *concurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for sub := range jobs {
-				r := checkSubdomain(sub, resolver, tmo)
-				results <- r
+			for host := range jobs {
+				host = strings.TrimSpace(host)
+				if host == "" || strings.HasPrefix(host, "#") {
+					continue
+				}
+
+				ok, _ := isServfailEitherResolver(host, tmo)
+				if !ok {
+					continue
+				}
+
+				// dig host +trace @1.1.1.1 and extract provider NS records
+				nsByProv, err := traceFindProviderNS(host, tmo)
+				if err != nil {
+					continue
+				}
+
+				// For any provider NS found, run dig host @NS and count REFUSED
+				// If any provider gets REFUSED>0, alert (and alert only once per provider).
+				for p, nsList := range nsByProv {
+					if len(nsList) == 0 {
+						continue
+					}
+					refusedCount := 0
+					for _, ns := range nsList {
+						if digStatusRefused(host, ns, tmo) {
+							refusedCount++
+						}
+					}
+					if refusedCount > 0 {
+						alerts <- fmt.Sprintf("[%s] DNS Zone takeover - %s", providerLabel(p), host)
+					}
+				}
 			}
 		}()
 	}
 
 	go func() {
-		for _, s := range subdomains {
-			s = strings.TrimSpace(s)
-			if s == "" || strings.HasPrefix(s, "#") {
+		for _, h := range hosts {
+			h = strings.TrimSpace(h)
+			if h == "" || strings.HasPrefix(h, "#") {
 				continue
 			}
-			jobs <- s
+			jobs <- h
 		}
 		close(jobs)
 		wg.Wait()
-		close(results)
+		close(alerts)
 	}()
 
-	for r := range results {
-		if *jsonOut {
-			b, _ := json.Marshal(r)
-			fmt.Println(string(b))
-		} else {
-			printHuman(r)
-		}
+	for a := range alerts {
+		fmt.Println(a)
 	}
-}
-
-func normalizeResolver(ip string) string {
-	ip = strings.TrimSpace(ip)
-	if ip == "1.1.1.1" || ip == "8.8.8.8" {
-		return net.JoinHostPort(ip, "53")
-	}
-	// allow user to pass "1.1.1.1:53"
-	host, port, err := net.SplitHostPort(ip)
-	if err == nil {
-		if (host == "1.1.1.1" || host == "8.8.8.8") && port == "53" {
-			return ip
-		}
-	}
-	return ""
-}
-
-func checkSubdomain(sub, resolver string, tmo time.Duration) Result {
-	sub = strings.TrimSpace(sub)
-	subFQDN := dns.Fqdn(sub)
-
-	res := Result{
-		Subdomain: sub,
-		Resolver:  resolver,
-	}
-
-	// 1) Check SERVFAIL via resolver (A query)
-	rcode, _, err := dnsQuery(subFQDN, dns.TypeA, resolver, true, tmo)
-	res.ServfailRcode = dns.RcodeToString[rcode]
-	if err != nil {
-		// If resolver query fails due to timeout/network, do not treat as SERVFAIL
-		res.Notes = append(res.Notes, "resolver_query_error:"+err.Error())
-		if *verbose {
-			fmt.Fprintln(os.Stderr, "[resolver-error]", sub, err)
-		}
-		return res
-	}
-
-	if rcode == dns.RcodeServerFailure {
-		res.Servfail = true
-	} else {
-		// Not servfail, stop here per your logic
-		return res
-	}
-
-	// 2) Fetch NS records of the subdomain via resolver
-	ns, nserr := fetchNS(subFQDN, resolver, tmo)
-	if nserr != nil {
-		res.Notes = append(res.Notes, "ns_lookup_error:"+nserr.Error())
-		if *verbose {
-			fmt.Fprintln(os.Stderr, "[ns-error]", sub, nserr)
-		}
-		return res
-	}
-	res.NSRecords = ns
-
-	// 3) Provider detection by your regex signals
-	provider := detectProvider(ns)
-	if provider == "" {
-		res.Notes = append(res.Notes, "no_provider_ns_match")
-		return res
-	}
-	res.Provider = provider
-
-	// 4) dig subdomain @nsrecord and check REFUSED (A query direct to NS)
-	// We test only NS records that match the provider regex (per your intent).
-	var probes []NSProbe
-	refusedAny := false
-	for _, n := range ns {
-		if !nsMatchesProvider(n, provider) {
-			continue
-		}
-		p := probeAuthoritative(subFQDN, n, tmo)
-		probes = append(probes, p)
-		if p.Error == "" && p.Rcode == "REFUSED" {
-			refusedAny = true
-		}
-	}
-	res.RefusedChecks = probes
-
-	// 5) Flag vulnerable if SERVFAIL + provider NS + REFUSED from at least one NS
-	if refusedAny {
-		res.Vulnerable = true
-	}
-	return res
-}
-
-func fetchNS(nameFQDN, resolver string, tmo time.Duration) ([]string, error) {
-	rcode, msg, err := dnsQuery(nameFQDN, dns.TypeNS, resolver, true, tmo)
-	if err != nil {
-		return nil, err
-	}
-	if rcode != dns.RcodeSuccess {
-		return nil, fmt.Errorf("NS lookup rcode=%s", dns.RcodeToString[rcode])
-	}
-
-	var out []string
-	seen := make(map[string]struct{})
-	for _, rr := range msg.Answer {
-		if nsrr, ok := rr.(*dns.NS); ok {
-			target := strings.TrimSuffix(nsrr.Ns, ".")
-			target = strings.ToLower(strings.TrimSpace(target))
-			if target == "" {
-				continue
-			}
-			if _, ok := seen[target]; ok {
-				continue
-			}
-			seen[target] = struct{}{}
-			out = append(out, target)
-		}
-	}
-	return out, nil
-}
-
-func detectProvider(ns []string) string {
-	for _, n := range ns {
-		n = strings.ToLower(n)
-		switch {
-		case reAWS.MatchString(n):
-			return "route53"
-		case reGCP.MatchString(n):
-			return "googledomains"
-		case reAzure.MatchString(n):
-			return "azure"
-		}
-	}
-	return ""
-}
-
-func nsMatchesProvider(ns, provider string) bool {
-	ns = strings.ToLower(ns)
-	switch provider {
-	case "route53":
-		return reAWS.MatchString(ns)
-	case "googledomains":
-		return reGCP.MatchString(ns)
-	case "azure":
-		return reAzure.MatchString(ns)
-	default:
-		return false
-	}
-}
-
-func probeAuthoritative(nameFQDN, nsHost string, tmo time.Duration) NSProbe {
-	start := time.Now()
-
-	nsHost = strings.TrimSpace(nsHost)
-	nsHost = strings.TrimSuffix(nsHost, ".")
-	// (removed unused nsHostFQDN)
-
-	// Resolve NS hostname to an IP using system resolver (not 1.1.1.1/8.8.8.8 requirement).
-	// Your requirement applies to the SERVFAIL check; this step is needed to talk to the NS.
-	ips, err := net.LookupIP(nsHost)
-	if err != nil || len(ips) == 0 {
-		return NSProbe{
-			NS:       nsHost,
-			Rcode:    "",
-			Duration: time.Since(start).Milliseconds(),
-			Error:    fmt.Sprintf("ns_ip_lookup_failed:%v", err),
-		}
-	}
-
-	// Prefer IPv4 if present
-	var ipStr string
-	for _, ip := range ips {
-		if ip.To4() != nil {
-			ipStr = ip.String()
-			break
-		}
-	}
-	if ipStr == "" {
-		ipStr = ips[0].String()
-	}
-
-	server := net.JoinHostPort(ipStr, "53")
-
-	// Equivalent to: dig A name @ns (RD=0)
-	rcode, _, qerr := dnsQuery(nameFQDN, dns.TypeA, server, false, tmo)
-	rcodeStr := dns.RcodeToString[rcode]
-
-	p := NSProbe{
-		NS:       nsHost,
-		Rcode:    rcodeStr,
-		Duration: time.Since(start).Milliseconds(),
-	}
-	if qerr != nil {
-		p.Error = qerr.Error()
-	}
-	return p
-}
-
-func dnsQuery(name string, qtype uint16, server string, rd bool, tmo time.Duration) (int, *dns.Msg, error) {
-	m := new(dns.Msg)
-	m.SetQuestion(name, qtype)
-	m.RecursionDesired = rd
-
-	c := new(dns.Client)
-	c.Timeout = tmo
-	c.Net = "udp"
-
-	in, _, err := c.Exchange(m, server)
-	if err != nil {
-		// Fallback to TCP for truncation or UDP issues
-		c2 := new(dns.Client)
-		c2.Timeout = tmo
-		c2.Net = "tcp"
-		in, _, err2 := c2.Exchange(m, server)
-		if err2 != nil {
-			return dns.RcodeServerFailure, nil, err
-		}
-		return in.Rcode, in, nil
-	}
-	return in.Rcode, in, nil
 }
 
 func readLines(path string) ([]string, error) {
@@ -342,45 +139,158 @@ func readLines(path string) ([]string, error) {
 	return out, sc.Err()
 }
 
-func printHuman(r Result) {
-	status := "OK"
-	if r.Servfail {
-		status = "SERVFAIL"
+func isServfailEitherResolver(host string, tmo time.Duration) (bool, string) {
+	// Must use either 1.1.1.1 or 8.8.8.8 (use both, no flag)
+	r1 := net.JoinHostPort("1.1.1.1", "53")
+	r2 := net.JoinHostPort("8.8.8.8", "53")
+
+	sf1 := isServfailWithResolver(host, r1, tmo)
+	if sf1 {
+		return true, "1.1.1.1"
 	}
-	if r.Vulnerable {
-		status = "VULNERABLE"
+	sf2 := isServfailWithResolver(host, r2, tmo)
+	if sf2 {
+		return true, "8.8.8.8"
+	}
+	return false, ""
+}
+
+func isServfailWithResolver(host, resolver string, tmo time.Duration) bool {
+	fqdn := dns.Fqdn(strings.TrimSpace(host))
+
+	m := new(dns.Msg)
+	m.SetQuestion(fqdn, dns.TypeA)
+	m.RecursionDesired = true
+
+	c := new(dns.Client)
+	c.Timeout = tmo
+	c.Net = "udp"
+
+	in, _, err := c.Exchange(m, resolver)
+	if err != nil {
+		// fallback to TCP
+		c2 := new(dns.Client)
+		c2.Timeout = tmo
+		c2.Net = "tcp"
+		in, _, err2 := c2.Exchange(m, resolver)
+		if err2 != nil {
+			return false
+		}
+		return in.Rcode == dns.RcodeServerFailure
 	}
 
-	fmt.Printf("%s\t%s\tresolver=%s", r.Subdomain, status, r.Resolver)
-	if r.Provider != "" {
-		fmt.Printf("\tprovider=%s", r.Provider)
-	}
-	if r.Servfail {
-		fmt.Printf("\tns=%d", len(r.NSRecords))
-		refusedCount := 0
-		for _, p := range r.RefusedChecks {
-			if p.Rcode == "REFUSED" && p.Error == "" {
-				refusedCount++
-			}
-		}
-		if len(r.RefusedChecks) > 0 {
-			fmt.Printf("\trefused=%d/%d", refusedCount, len(r.RefusedChecks))
-		}
-	}
-	if r.ServfailRcode != "" {
-		fmt.Printf("\trcode=%s", r.ServfailRcode)
-	}
-	fmt.Println()
+	return in.Rcode == dns.RcodeServerFailure
+}
 
-	if *verbose {
-		if len(r.NSRecords) > 0 {
-			fmt.Fprintf(os.Stderr, "  NS: %s\n", strings.Join(r.NSRecords, ", "))
-		}
-		for _, p := range r.RefusedChecks {
-			fmt.Fprintf(os.Stderr, "  @%s rcode=%s err=%s\n", p.NS, p.Rcode, p.Error)
-		}
-		for _, n := range r.Notes {
-			fmt.Fprintf(os.Stderr, "  note: %s\n", n)
-		}
+func traceFindProviderNS(host string, tmo time.Duration) (map[provider][]string, error) {
+	// dig host +trace @1.1.1.1
+	// Extract NS lines that match our 3 regex patterns.
+	out, err := runDig(tmo, host, "+trace", "@1.1.1.1")
+	if err != nil {
+		return nil, err
 	}
+
+	nsByProv := map[provider][]string{
+		provRoute53:       {},
+		provGoogleDomains: {},
+		provAzureDNS:      {},
+	}
+
+	seen := make(map[string]struct{})
+
+	lines := strings.Split(out, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// quick prefilter for our provider regex
+		lower := strings.ToLower(line)
+		if !(reAWS.MatchString(lower) || reGCP.MatchString(lower) || reAzure.MatchString(lower)) {
+			continue
+		}
+
+		// try to parse NS hostname from trace line
+		m := reTraceNSLine.FindStringSubmatch(line)
+		if len(m) != 2 {
+			continue
+		}
+
+		ns := strings.ToLower(strings.TrimSuffix(m[1], "."))
+		if ns == "" {
+			continue
+		}
+		if _, ok := seen[ns]; ok {
+			continue
+		}
+		seen[ns] = struct{}{}
+
+		p := classifyProvider(ns)
+		if p == provUnknown {
+			continue
+		}
+		nsByProv[p] = append(nsByProv[p], ns)
+	}
+
+	return nsByProv, nil
+}
+
+func classifyProvider(ns string) provider {
+	ns = strings.ToLower(ns)
+	switch {
+	case reAWS.MatchString(ns):
+		return provRoute53
+	case reGCP.MatchString(ns):
+		return provGoogleDomains
+	case reAzure.MatchString(ns):
+		return provAzureDNS
+	default:
+		return provUnknown
+	}
+}
+
+func providerLabel(p provider) string {
+	switch p {
+	case provRoute53:
+		return "Route53"
+	case provGoogleDomains:
+		return "GoogleDomains"
+	case provAzureDNS:
+		return "AzureDNS"
+	default:
+		return "Unknown"
+	}
+}
+
+func digStatusRefused(host, ns string, tmo time.Duration) bool {
+	// dig host @ns and grep REFUSED (we match dig header "status: REFUSED")
+	out, err := runDig(tmo, host, "@"+ns)
+	if err != nil {
+		return false
+	}
+	// dig output has: ";; ->>HEADER<<- opcode: QUERY, status: REFUSED, id: ..."
+	return strings.Contains(out, "status: REFUSED")
+}
+
+func runDig(tmo time.Duration, args ...string) (string, error) {
+	// Make dig a bit deterministic and fast
+	// +time / +tries applied so it doesn’t hang per NS.
+	base := []string{"+time=2", "+tries=1", "+retry=0"}
+	all := append(base, args...)
+
+	cmd := exec.Command("dig", all...)
+	// Hard kill if it runs too long (slightly above our tmo)
+	killAfter := tmo + (500 * time.Millisecond)
+	timer := time.AfterFunc(killAfter, func() {
+		_ = cmd.Process.Kill()
+	})
+	defer timer.Stop()
+
+	b, err := cmd.CombinedOutput()
+	if err != nil {
+		// still return output for debugging if needed, but caller uses error to skip
+		return "", err
+	}
+	return string(b), nil
 }
